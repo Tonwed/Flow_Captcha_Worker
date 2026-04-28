@@ -70,6 +70,15 @@ function resolveChromeExecutable() {
   return null;
 }
 
+const NON_SOLVE_RESTART_REASONS = new Set([
+  'init_failure',
+  'page_setup_failure',
+  'proxy_failure',
+  'warmup_failure',
+]);
+
+const MAX_NON_SOLVE_FAILURES = 10;
+
 class BrowserWorker {
   constructor(nodeId, proxyHost, initialStats = null) {
     this.nodeId = nodeId;
@@ -84,9 +93,70 @@ class BrowserWorker {
     this.restartFailCount = 0;
     this.isRestarting = false;
     this.isShuttingDown = false; // Flag to indicate graceful deletion
+    this.isPaused = false;
+    this.pauseReason = null;
+    this.nonSolveFailureCount = 0;
+    this.lastRestartReason = null;
+    this.lastErrorMessage = null;
     this.stats = initialStats ? { ...initialStats } : { generated: 0, success: 0, failed: 0 };
     this.isSubProxy = false;
     this.realProxyHost = proxyHost;
+  }
+
+  _isNonSolveReason(reason) {
+    return NON_SOLVE_RESTART_REASONS.has(reason);
+  }
+
+  _resetPauseState() {
+    this.isPaused = false;
+    this.pauseReason = null;
+    this.nonSolveFailureCount = 0;
+    this.lastErrorMessage = null;
+  }
+
+  async _closeRuntime({ killSubProxy = false } = {}) {
+    if (this.page && !this.page.isClosed()) {
+      await this.page.close().catch(() => {});
+    }
+    this.page = null;
+
+    if (this.browser) {
+      await this.browser.close().catch(() => {});
+    }
+    this.browser = null;
+
+    if (killSubProxy && this.isSubProxy) {
+      await killProxyCore(this.nodeId).catch(() => {});
+      this.realProxyHost = null;
+    }
+  }
+
+  async _pause(reason, error) {
+    this.isPaused = true;
+    this.ready = false;
+    this.isRestarting = false;
+    this.pauseReason = reason;
+    this.lastRestartReason = reason;
+    this.lastErrorMessage = error?.message || this.lastErrorMessage;
+    await this._closeRuntime({ killSubProxy: true });
+    console.error(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[31m⏸ 已暂停:\x1b[0m ${reason} (非打码异常累计 ${this.nonSolveFailureCount}/${MAX_NON_SOLVE_FAILURES})`);
+  }
+
+  async handleFailure(reason, error) {
+    if (this.isShuttingDown) return;
+
+    this.lastRestartReason = reason;
+    this.lastErrorMessage = error?.message || null;
+
+    if (this._isNonSolveReason(reason)) {
+      this.nonSolveFailureCount++;
+      if (this.nonSolveFailureCount >= MAX_NON_SOLVE_FAILURES) {
+        await this._pause(reason, error);
+        return;
+      }
+    }
+
+    await this._handleRestart({ reason });
   }
 
   _generateFingerprint() {
@@ -155,19 +225,25 @@ class BrowserWorker {
   }
 
   async init() {
-    if (this.isShuttingDown) return;
+    if (this.isShuttingDown || this.isPaused) return;
     
     this.fingerprint = this._generateFingerprint();
     const fp = this.fingerprint;
     const executablePath = resolveChromeExecutable();
 
-    if (this.proxyHost && typeof this.proxyHost === 'object' && this.proxyHost.server) {
-      if (!this.realProxyHost || typeof this.realProxyHost !== 'string') {
-        this.isSubProxy = true;
-        this.realProxyHost = await spawnProxyCore(this.nodeId, this.proxyHost.config || this.proxyHost);
+    try {
+      if (this.proxyHost && typeof this.proxyHost === 'object' && this.proxyHost.server) {
+        if (!this.realProxyHost || typeof this.realProxyHost !== 'string') {
+          this.isSubProxy = true;
+          this.realProxyHost = await spawnProxyCore(this.nodeId, this.proxyHost.config || this.proxyHost);
+        }
+      } else {
+        this.realProxyHost = this.proxyHost;
       }
-    } else {
-      this.realProxyHost = this.proxyHost;
+    } catch (error) {
+      error.restartReason = 'proxy_failure';
+      error.message = `Failed to initialize proxy core: ${error.message}`;
+      throw error;
     }
 
     console.log(`\x1b[36m[Node-${this.nodeId}]\x1b[0m 🚀 Init config proxy: ${this.realProxyHost || 'None'}`);
@@ -198,7 +274,13 @@ class BrowserWorker {
       args
     });
 
-    await this._setupPage();
+    try {
+      await this._setupPage();
+    } catch (error) {
+      error.restartReason = error.restartReason || 'page_setup_failure';
+      throw error;
+    }
+    this._resetPauseState();
     if (!this.isShuttingDown) {
       console.log(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[32m✅ Ready.\x1b[0m`);
     } else {
@@ -207,7 +289,7 @@ class BrowserWorker {
   }
 
   async _setupPage() {
-    if (this.isShuttingDown || !this.browser) return;
+    if (this.isShuttingDown || this.isPaused || !this.browser) return;
     
     const fp = this.fingerprint;
     this.page = await this.browser.newPage();
@@ -309,24 +391,29 @@ class BrowserWorker {
   }
 
   async _recover() {
-    if (this.isRestarting || this.isShuttingDown) return;
+    if (this.isRestarting || this.isShuttingDown || this.isPaused) return;
     console.log(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[33m🔄 Recovering...\x1b[0m`);
     this.ready = false;
     try {
       if (this.page && !this.page.isClosed()) {
-        try { await this.page.close(); } catch (e) { }
+        await this.page.close().catch(() => {});
       }
+      this.page = null;
       await this._setupPage();
       if (!this.isShuttingDown) console.log(`[Node-${this.nodeId}] ✅ Recovery success`);
     } catch (e) {
       if (!this.isShuttingDown) console.error(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[31m❌ Recovery failed:\x1b[0m`, e.message);
+      await this.handleFailure('warmup_failure', e);
     }
   }
 
-  async _handleRestart() {
+  async _handleRestart({ reason = 'unknown', force = false } = {}) {
     if (this.isRestarting || this.isShuttingDown) return;
+    if (this.isPaused && !force) return;
+
     this.isRestarting = true;
     this.ready = false;
+    this.lastRestartReason = reason;
 
     const delayMs = Math.min(this.restartFailCount * 10000, 30000);
     if (delayMs > 0 && !this.isShuttingDown) {
@@ -334,18 +421,14 @@ class BrowserWorker {
       await new Promise(r => setTimeout(r, delayMs));
     }
     
-    if (this.isShuttingDown) {
+    if (this.isShuttingDown || (this.isPaused && !force)) {
       this.isRestarting = false;
       return;
     }
 
     console.log(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[33m🔄 开始彻底销毁并重启浏览器实例...\x1b[0m`);
     try {
-      if (this.browser) {
-        await this.browser.close().catch(() => { });
-      }
-      this.browser = null;
-      this.page = null;
+      await this._closeRuntime();
       await this.init();
       this.consecutiveFailures = 0;
       this.restartFailCount = 0;
@@ -356,7 +439,9 @@ class BrowserWorker {
         this.restartFailCount++;
       }
       this.isRestarting = false;
-      if (!this.isShuttingDown) this._handleRestart().catch(() => { });
+      if (!this.isShuttingDown) {
+        await this.handleFailure('warmup_failure', e);
+      }
       return;
     }
     this.isRestarting = false;
@@ -366,18 +451,32 @@ class BrowserWorker {
     this.isShuttingDown = true;
     this.ready = false;
     try {
-      if (this.browser) {
-        await this.browser.close().catch(() => {});
-      }
-      if (this.isSubProxy) {
-        await killProxyCore(this.nodeId);
-      }
+      await this._closeRuntime({ killSubProxy: true });
       console.log(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[35m💀 Node safely terminated.\x1b[0m`);
     } catch(e) {}
   }
 
+  async manualRestart() {
+    if (this.isShuttingDown) {
+      throw new Error('Worker is shutting down');
+    }
+    if (this.isFetching) {
+      throw new Error('Worker is busy processing a task');
+    }
+
+    this._resetPauseState();
+    this.ready = false;
+    this.restartFailCount = 0;
+
+    await this._handleRestart({ reason: 'manual_restart', force: true });
+
+    if (this.isPaused) {
+      throw new Error(this.lastErrorMessage || 'Manual restart failed');
+    }
+  }
+
   async executeToken(action) {
-    if (!this.ready || this.isShuttingDown) throw new Error("Worker not ready or shutting down");
+    if (!this.ready || this.isShuttingDown || this.isPaused) throw new Error("Worker not ready or shutting down");
     // NOTE: isFetching is managed exclusively by _dispatchTask (GlobalTokenPool)
     // to prevent race conditions with the 500ms wakeup timer.
 
@@ -404,7 +503,7 @@ class BrowserWorker {
       console.error(`\x1b[36m[Node-${this.nodeId}]\x1b[0m \x1b[31m❌ Execution failed (连续失败: ${this.consecutiveFailures}次):\x1b[0m`, e.message);
 
       if (this.consecutiveFailures >= 1) {
-        this._handleRestart().catch(() => { });
+        this.handleFailure('execute_failure', e).catch(() => { });
       } else {
         this._recover().catch(() => { });
       }

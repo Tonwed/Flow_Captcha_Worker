@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useMemo, useRef } from "react";
-import { Server, Zap, HardDrive, RefreshCw, Plus, Cpu, Activity, Info, Trash2, PowerOff, Flag, FlagOff, Heart } from "lucide-react";
+import { Server, Zap, HardDrive, RefreshCw, Plus, Cpu, Activity, Info, Trash2, PowerOff, Flag, FlagOff, Heart, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
@@ -100,6 +100,17 @@ export default function WorkersPage() {
   
   const workersRef = useRef<any[]>([]);
   useEffect(() => { workersRef.current = workers; }, [workers]);
+
+  const reasonLabels: Record<string, string> = {
+    init_failure: '初始化失败',
+    page_setup_failure: '页面预热失败',
+    proxy_failure: '代理初始化失败',
+    warmup_failure: '预热重启失败',
+    execute_failure: '打码执行失败',
+    business_error: '业务验证失败',
+    post_task_recycle: '任务后指纹轮换',
+    manual_restart: '手动重启',
+  };
 
   const fetchWorkers = async () => {
     try {
@@ -315,6 +326,22 @@ export default function WorkersPage() {
     }
   };
 
+  const restartWorker = async (id: string, e: any) => {
+    e.stopPropagation();
+    try {
+      const res = await fetch(`/worker-api/workers/${id}/restart`, {
+        method: "POST",
+        headers: { 'Authorization': `Bearer ${localStorage.getItem("admin_token")}` }
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "无法重启实例");
+      fetchWorkers();
+      toast.success(`Worker-${id} 已进入手动重启流程`);
+    } catch(err: any) {
+      toast.error(err.message);
+    }
+  };
+
   const toggleNodeFlag = async (nodeId: string, currentFlag: boolean, e: any) => {
     e.stopPropagation();
     try {
@@ -460,34 +487,50 @@ export default function WorkersPage() {
           ))
         ) : workers.length > 0 ? workers.map((w) => {
           const isDead = w.isShuttingDown;
+          const isPaused = w.isPaused;
           const total = w.stats.success + w.stats.failed;
           const successRate = total === 0 ? 100 : Math.round((w.stats.success / total) * 100);
+          const pauseLabel = w.pauseReason ? (reasonLabels[w.pauseReason] || w.pauseReason) : '未知原因';
+          const statusLabel = isDead ? 'Terminated' : (isPaused ? 'Paused' : (w.isFetching ? 'Processing' : 'Standby'));
 
           return (
-            <div key={w.nodeId} className={`group relative bg-background/50 backdrop-blur-sm shadow-minimal rounded-2xl border p-4 flex flex-col hover:shadow-md transition-all duration-300 ${isDead ? 'border-destructive/20 opacity-60' : 'border-border/50 hover:border-primary/30'}`}>
+            <div key={w.nodeId} className={`group relative bg-background/50 backdrop-blur-sm shadow-minimal rounded-2xl border p-4 flex flex-col hover:shadow-md transition-all duration-300 ${isDead ? 'border-destructive/20 opacity-60' : (isPaused ? 'border-yellow-500/30' : 'border-border/50 hover:border-primary/30')}`}>
               
               {/* Header */}
               <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-3">
                    <span className="relative flex h-3 w-3">
-                     {!isDead && w.ready && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75"></span>}
-                     <span className={`relative inline-flex rounded-full h-3 w-3 ${isDead ? 'bg-destructive/60' : (w.ready ? 'bg-success' : 'bg-amber-400')}`}></span>
+                     {!isDead && !isPaused && w.ready && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75"></span>}
+                     <span className={`relative inline-flex rounded-full h-3 w-3 ${isDead ? 'bg-destructive/60' : (isPaused ? 'bg-yellow-500' : (w.ready ? 'bg-success' : 'bg-amber-400'))}`}></span>
                    </span>
                    <div className="flex flex-col">
                      <h3 className="font-semibold text-foreground text-[15px] tracking-tight leading-none mb-1">
                        Worker-{w.nodeId}
                      </h3>
                      <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                       {isDead ? 'Terminated' : (w.isFetching ? 'Processing' : 'Standby')}
+                       {statusLabel}
                      </span>
                    </div>
                 </div>
-                {!isDead && (
-                  <Button variant="ghost" size="icon" onClick={(e) => killWorker(w.nodeId, e)} className="h-8 w-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors shrink-0 -mr-1 -mt-1 rounded-full">
+                {!isDead && (isPaused ? (
+                  <Button variant="ghost" size="icon" onClick={(e) => restartWorker(w.nodeId, e)} className="h-8 w-8 text-muted-foreground hover:bg-primary/10 hover:text-primary transition-colors shrink-0 -mr-1 -mt-1 rounded-full" title="手动重启">
+                    <RotateCcw className="w-4 h-4" />
+                  </Button>
+                ) : (
+                  <Button variant="ghost" size="icon" onClick={(e) => killWorker(w.nodeId, e)} className="h-8 w-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors shrink-0 -mr-1 -mt-1 rounded-full" title="停止实例">
                     <PowerOff className="w-4 h-4" />
                   </Button>
-                )}
+                ))}
               </div>
+
+              {isPaused && (
+                <div className="mb-3 rounded-lg border border-yellow-500/20 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-300">
+                  <div className="font-semibold">已暂停，等待手动重启</div>
+                  <div className="mt-1">原因: {pauseLabel}</div>
+                  <div className="mt-1">非打码异常累计: {w.nonSolveFailureCount}/10</div>
+                  {w.lastErrorMessage && <div className="mt-1 break-all text-[11px] opacity-90">{w.lastErrorMessage}</div>}
+                </div>
+              )}
 
               {/* Proxy Info Pill */}
               <div className="flex flex-col gap-1 text-xs font-medium text-foreground bg-secondary/30 px-2.5 py-2 rounded-lg border border-border/30 w-full mb-3 transition-colors group-hover:bg-secondary/60">
@@ -539,6 +582,11 @@ export default function WorkersPage() {
                      <div className="flex items-center gap-1.5 mt-1 text-[10px] text-muted-foreground border-t border-border/40 pt-1.5">
                        <Server className="w-3 h-3 opacity-60" />
                        <span className="truncate">{matchSub ? (matchSub.remark || matchSub.url) : '静态配置/私人节点'}</span>
+                       {w.lastRestartReason && (
+                         <span className="ml-auto rounded bg-background/70 px-1.5 py-0.5 text-[9px] uppercase tracking-wider">
+                           {reasonLabels[w.lastRestartReason] || w.lastRestartReason}
+                         </span>
+                       )}
                      </div>
                    );
                 })()}

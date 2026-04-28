@@ -7,7 +7,8 @@
     "start": "node index.js",
     "dev": "npx concurrently \"npm start\" \"npm run dev --prefix frontend\"",
     "build": "cd frontend && npm run build",
-    "start:prod": "npx concurrently \"npm start\" \"npm start --prefix frontend\""
+    "start:prod": "npx concurrently \"npm start\" \"npm start --prefix frontend\"",
+    "cleanup:runtime": "bash ./scripts/cleanup-runtime.sh"
   },
   "workspaces": [
     "frontend"

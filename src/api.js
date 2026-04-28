@@ -10,6 +10,24 @@ function createApiApp(pool) {
   app.use(cors());
   app.use(express.json());
 
+  const serializeWorker = (w) => ({
+    nodeId: w.nodeId,
+    id: w.nodeId,
+    proxyHost: w.proxyHost,
+    isSubProxy: w.isSubProxy,
+    ready: w.ready,
+    isFetching: w.isFetching,
+    isShuttingDown: w.isShuttingDown,
+    isPaused: w.isPaused,
+    pauseReason: w.pauseReason,
+    nonSolveFailureCount: w.nonSolveFailureCount,
+    lastRestartReason: w.lastRestartReason,
+    lastErrorMessage: w.lastErrorMessage,
+    stats: w.stats,
+    userAgent: w.fingerprint ? w.fingerprint.ua : null,
+    screen: w.fingerprint ? w.fingerprint.screen : null
+  });
+
   // Static directory mapping if needed
   app.use(express.static(path.join(__dirname, '..', 'frontend', 'out')));
 
@@ -20,14 +38,7 @@ function createApiApp(pool) {
       totalSuccess: pool.workers.reduce((sum, w) => sum + w.stats.success, 0),
       totalFailed: pool.workers.reduce((sum, w) => sum + w.stats.failed, 0),
       activeNodeCount: pool.workers.length,
-      nodes: pool.workers.map(w => ({
-        id: w.nodeId,
-        proxyHost: w.proxyHost,
-        ready: w.ready,
-        isFetching: w.isFetching,
-        isShuttingDown: w.isShuttingDown,
-        stats: w.stats
-      }))
+      nodes: pool.workers.map(serializeWorker)
     };
     return res.json(status);
   });
@@ -313,17 +324,7 @@ function createApiApp(pool) {
   });
 
   app.get('/api/v1/workers', (req, res) => {
-    const dump = pool.workers.map(w => ({
-      nodeId: w.nodeId,
-      proxyHost: w.proxyHost,
-      isSubProxy: w.isSubProxy,
-      ready: w.ready,
-      isFetching: w.isFetching,
-      isShuttingDown: w.isShuttingDown,
-      stats: w.stats,
-      userAgent: w.fingerprint ? w.fingerprint.ua : null,
-      screen: w.fingerprint ? w.fingerprint.screen : null
-    }));
+    const dump = pool.workers.map(serializeWorker);
     return res.json(dump);
   });
 
@@ -354,6 +355,15 @@ function createApiApp(pool) {
       await pool.removeNode(Number(req.params.id));
       return res.json({ status: 'ok' });
     } catch(err) {
+      return res.status(400).json({ detail: err.message });
+    }
+  });
+
+  app.post('/api/v1/workers/:id/restart', async (req, res) => {
+    try {
+      const worker = await pool.restartWorker(Number(req.params.id));
+      return res.json({ status: 'ok', worker: serializeWorker(worker) });
+    } catch (err) {
       return res.status(400).json({ detail: err.message });
     }
   });

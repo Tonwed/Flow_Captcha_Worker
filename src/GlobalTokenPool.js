@@ -18,7 +18,7 @@ class GlobalTokenPool {
       worker.stats.failed++;
       this._saveWorkerStats(worker);
       console.log(`\x1b[33m[Pool]\x1b[0m 🛑 检测到 Node-${nodeId} 业务验证失败，触发紧急自毁重建指令！`);
-      worker._handleRestart().catch(() => { });
+      worker.handleFailure('business_error', new Error('Business validation failed')).catch(() => { });
     }
     if (projectId) {
       if (!this.projectFailedNodes.has(projectId)) this.projectFailedNodes.set(projectId, new Set());
@@ -47,7 +47,7 @@ class GlobalTokenPool {
       this.workers.push(worker);
       initPromises.push(worker.init().catch(e => {
         console.error(`\x1b[36m[Node-${worker.nodeId}]\x1b[0m \x1b[31m❌ 初次 Init failed:\x1b[0m`, e.message);
-        worker._handleRestart().catch(() => { });
+        worker.handleFailure(e.restartReason || 'init_failure', e).catch(() => { });
       }));
     }
     await Promise.all(initPromises);
@@ -66,10 +66,17 @@ class GlobalTokenPool {
     this.workers.push(worker);
     worker.init().catch(e => {
       console.error(`\x1b[36m[Node-${nodeId}]\x1b[0m \x1b[31m❌ 初次动态 Init failed:\x1b[0m`, e.message);
-      worker._handleRestart().catch(() => { });
+      worker.handleFailure(e.restartReason || 'init_failure', e).catch(() => { });
     });
     console.log(`\x1b[33m[Pool]\x1b[0m ➕ 正在同步挂载持久化新节点 Node-${nodeId}...`);
     return nodeId;
+  }
+
+  async restartWorker(nodeId) {
+    const worker = this.workers.find(w => w.nodeId === nodeId);
+    if (!worker) throw new Error('Node not currently active in pool');
+    await worker.manualRestart();
+    return worker;
   }
 
   async removeNode(nodeId) {
@@ -95,7 +102,7 @@ class GlobalTokenPool {
   _wakeupIdles() {
     const needed = this.waitQueue.length;
     if (needed > 0) {
-      const idles = this.workers.filter(w => w.ready && !w.isFetching && !w.isShuttingDown);
+      const idles = this.workers.filter(w => w.ready && !w.isFetching && !w.isShuttingDown && !w.isPaused);
       if (idles.length === 0) return;
 
       for (let i = idles.length - 1; i > 0; i--) {
@@ -119,7 +126,7 @@ class GlobalTokenPool {
   }
 
   async _dispatchTask(worker) {
-    if (worker.isFetching || !worker.ready || worker.isShuttingDown) return;
+    if (worker.isFetching || !worker.ready || worker.isShuttingDown || worker.isPaused) return;
 
     let targetAction = '';
     let waiterIdx = -1;
@@ -154,10 +161,10 @@ class GlobalTokenPool {
       }
     } finally {
       worker.isFetching = false;
-      if (!worker.isShuttingDown) {
+      if (!worker.isShuttingDown && !worker.isPaused) {
         worker.ready = false;
         console.log(`\x1b[33m[Pool]\x1b[0m ♻️ 任务结束，单次使用要求：强制销毁 Node-${worker.nodeId} 并生成全新指纹重启...`);
-        worker._handleRestart().catch(() => { });
+        worker._handleRestart({ reason: 'post_task_recycle' }).catch(() => { });
         this._wakeupIdles();
       }
     }
